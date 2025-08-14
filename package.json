@@ -1,5 +1,6 @@
 {
   "name": "comic-ebay-backend",
+  "license": "MIT",
   "version": "1.0.0",
   "description": "Backend proxy for searching eBay sold listings for comic titles",
   "type": "module",

@@ -11,8 +11,8 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
-const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID;
-const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
+const EBAY_CLIENT_ID = (process.env.EBAY_CLIENT_ID || '').trim();
+const EBAY_CLIENT_SECRET = (process.env.EBAY_CLIENT_SECRET || '').trim();
 
 if (!EBAY_CLIENT_ID || !EBAY_CLIENT_SECRET) {
   console.warn("[WARN] EBAY_CLIENT_ID or EBAY_CLIENT_SECRET not set. Set them in Render env vars or a local .env file.");

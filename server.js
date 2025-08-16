@@ -1,17 +1,16 @@
-// server.js — Browse API + Finding fallback + Deletion notifications + Auto subscription enable
-// Endpoints:
-//   GET  /api/health
-//   GET  /api/auth-test
-//   GET  /api/sold?title=...&limit=..
-//   ALL  /ebay/account-deletion
-//   GET  /api/deletion-notifications
-//   POST /api/enable-subscription   (manual trigger; also runs automatically on startup)
+// server.js — No external fetch dependency (uses Node's built-in fetch)
+// Features:
+//   - eBay Browse API (OAuth) with automatic Finding API fallback
+//   - /api/auth-test  : verify OAuth
+//   - /api/sold       : sold listings (Browse → Finding)
+//   - /ebay/account-deletion : GET challenge + POST notifications (logged)
+//   - /api/deletion-notifications : view last 50 notifications
+//   - /api/enable-subscription   : manually enable subscription (also runs on boot)
 
 import express from 'express';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import crypto from 'crypto';
-import fetch from 'node-fetch';
 
 dotenv.config();
 
@@ -27,14 +26,14 @@ const EBAY_APP_ID        = (process.env.EBAY_APP_ID || EBAY_CLIENT_ID || '').tri
 const EBAY_DELETION_VERIFICATION_TOKEN = (process.env.EBAY_DELETION_VERIFICATION_TOKEN || '').trim();
 const EBAY_DELETION_ENDPOINT_URL       = (process.env.EBAY_DELETION_ENDPOINT_URL || '').trim();
 
-// Subscription API config (base + path are configurable to match eBay docs)
-const SUBS_BASE = (process.env.EBAY_SUBSCRIPTION_API_BASE || 'https://api.ebay.com').trim();
+// Subscription API config (adjustable via env if needed)
+const SUBS_BASE = (process.env.EBAY_SUBSCRIPTION_API_BASE || 'https://api.ebay.com').trim(); // <-- ensure it's api.ebay.com (not apiz)
 const SUBS_PATH = (process.env.EBAY_SUBSCRIPTION_ENABLE_PATH || '/developer/notifications/v1/subscription/enable').trim();
 const SUBS_TOPIC = (process.env.EBAY_SUBSCRIPTION_TOPIC_ID || 'MARKETPLACE_ACCOUNT_DELETION').trim();
 
 const PORT = process.env.PORT || 3001;
 
-// Debug hints (won't block)
+// Debug hints (won't leak secrets)
 console.log('[BOOT] EBAY_CLIENT_ID len:', EBAY_CLIENT_ID.length, 'preview:', EBAY_CLIENT_ID ? EBAY_CLIENT_ID.slice(0,4)+'…'+EBAY_CLIENT_ID.slice(-4) : null);
 console.log('[BOOT] EBAY_CLIENT_SECRET len:', EBAY_CLIENT_SECRET.length);
 if (SUBS_BASE.includes('apiz.ebay.com')) {
@@ -48,18 +47,19 @@ async function getAppToken() {
   const now = Date.now();
   if (tokenCache.token && now < tokenCache.expiresAt) return tokenCache.token;
 
-  const clientId = EBAY_CLIENT_ID;
-  const clientSecret = EBAY_CLIENT_SECRET;
+  const basic = Buffer.from(`${EBAY_CLIENT_ID}:${EBAY_CLIENT_SECRET}`).toString('base64');
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    scope: 'https://api.ebay.com/oauth/api_scope',
+  }).toString();
 
-  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
   const resp = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
     method: 'POST',
     headers: {
       'Authorization': `Basic ${basic}`,
-      'Content-Type': 'application/x-www-form-urlencoded'
+      'Content-Type': 'application/x-www-form-urlencoded',
     },
-    body: 'grant_type=client_credentials&scope=' + encodeURIComponent('https://api.ebay.com/oauth/api_scope'),
-    timeout: 15000
+    body,
   });
 
   if (!resp.ok) {
@@ -69,7 +69,10 @@ async function getAppToken() {
   }
 
   const data = await resp.json();
-  tokenCache = { token: data.access_token, expiresAt: now + (data.expires_in * 1000 * 0.9) };
+  tokenCache = {
+    token: data.access_token,
+    expiresAt: now + (data.expires_in * 1000 * 0.9), // refresh ~10% early
+  };
   return tokenCache.token;
 }
 
@@ -96,7 +99,8 @@ app.get('/api/auth-test', async (_req, res) => {
 
 // ---------- Browse + Finding helpers ----------
 async function fetchSoldBrowse(title, limit) {
-  const t = await getAppToken();
+  const t = await getAppToken(); // throws on OAuth issues
+
   const url = new URL('https://api.ebay.com/buy/browse/v1/item_summary/search');
   const filter = [
     'deliveryCountry:US',
@@ -113,9 +117,8 @@ async function fetchSoldBrowse(title, limit) {
   const r = await fetch(url.toString(), {
     headers: {
       'Authorization': `Bearer ${t}`,
-      'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+      'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
     },
-    timeout: 20000
   });
 
   if (!r.ok) {
@@ -146,7 +149,7 @@ async function fetchSoldFinding(title, limit) {
     'sortOrder': 'EndTimeSoonest',
   });
 
-  const r = await fetch(`${base}?${params.toString()}`, { timeout: 20000 });
+  const r = await fetch(`${base}?${params.toString()}`);
   const data = await r.json().catch(()=> ({}));
   const resp = data?.findCompletedItemsResponse?.[0];
   const ack = resp?.ack?.[0];
@@ -204,7 +207,7 @@ app.get('/api/sold', async (req, res) => {
 });
 
 // ---------- Deletion notifications (challenge + POST logging) ----------
-const recentDeletionNotifications = []; // last 50 entries in memory
+const recentDeletionNotifications = []; // last 50 entries (in memory)
 
 app.all('/ebay/account-deletion', async (req, res) => {
   try {
@@ -270,7 +273,6 @@ async function enableSubscriptionOnce() {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(payload),
-      timeout: 20000
     });
 
     const txt = await r.text().catch(()=> '');

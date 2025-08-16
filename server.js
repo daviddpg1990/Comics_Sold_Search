@@ -1,4 +1,4 @@
-// server.js (ESM)
+// server.js
 import express from 'express';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
@@ -10,38 +10,30 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ======================= ENV =======================
+// ===== ENV VARS =====
 const PORT = process.env.PORT || 10000;
 
-// For sold/complete searches (Finding API)
+// Sold/completed search
 const EBAY_APP_ID = (process.env.EBAY_APP_ID || '').trim();
 
-// For OAuth (client-credentials) to manage subscriptions
+// OAuth (subscriptions)
 const EBAY_CLIENT_ID = (process.env.EBAY_CLIENT_ID || '').trim();
 const EBAY_CLIENT_SECRET = (process.env.EBAY_CLIENT_SECRET || '').trim();
 
-// For webhook challenge (exactly match what you put in the eBay portal)
+// Webhook verification
 const EBAY_DELETION_VERIFICATION_TOKEN = (process.env.EBAY_DELETION_VERIFICATION_TOKEN || '').trim();
-
-// Your public base URL (domain that eBay calls). Example: https://your-domain.com
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').trim();
+const EBAY_DELETION_ENDPOINT_URL = (process.env.EBAY_DELETION_ENDPOINT_URL || '').trim();
 
-// Notification API base (usually apiz.ebay.com for production)
+// Subscriptions
 const EBAY_SUBSCRIPTION_API_BASE = (process.env.EBAY_SUBSCRIPTION_API_BASE || 'https://apiz.ebay.com').trim();
-
-// TopicId shown in your portal for Marketplace Account Deletion/Closure
-// If your portal shows a different value, set it here.
 const EBAY_SUBSCRIPTION_TOPIC_ID = (process.env.EBAY_SUBSCRIPTION_TOPIC_ID || 'MARKETPLACE_ACCOUNT_DELETION').trim();
 
-// ======================= CONSTANTS =======================
+// Derived webhook URL
 const WEBHOOK_PATH = '/ebay/account-deletion';
-const WEBHOOK_URL = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}${WEBHOOK_PATH}` : '';
+const WEBHOOK_URL = EBAY_DELETION_ENDPOINT_URL || (PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}${WEBHOOK_PATH}` : '');
 
-// Finding API (completed/sold comps)
-const EBAY_FINDING_URL = 'https://svcs.ebay.com/services/search/FindingService/v1';
-const CATEGORY_COMICS = '63';
-
-// ======================= HELPERS =======================
+// ===== HELPERS =====
 function requireEnv(name, val) {
   if (!val) throw new Error(`Missing required env var: ${name}`);
 }
@@ -86,41 +78,35 @@ async function getAppAccessToken(scopes = ['https://api.ebay.com/oauth/api_scope
   return data.access_token;
 }
 
-// ======================= 1) WEBHOOK (GET+POST) =======================
-// eBay calls GET first with a challenge; you must echo SHA-256 of:
-//   challengeCode + verificationToken + endpointURL
-// Also accept POST notifications and immediately 200.
-app.use(WEBHOOK_PATH, express.text({ type: '*/*' })); // be lenient with content-type
+// ===== 1) WEBHOOK (GET+POST) =====
+app.use(WEBHOOK_PATH, express.text({ type: '*/*' }));
 
 app.all(WEBHOOK_PATH, async (req, res) => {
   try {
     const challenge = req.query.challenge_code || req.query.challengeCode || '';
 
     if (challenge) {
-      // Validate required env for challenge hashing
       requireEnv('EBAY_DELETION_VERIFICATION_TOKEN', EBAY_DELETION_VERIFICATION_TOKEN);
-      requireEnv('PUBLIC_BASE_URL', PUBLIC_BASE_URL);
-      const endpointUrl = WEBHOOK_URL; // exact URL you registered in the portal
-      if (!endpointUrl) throw new Error('WEBHOOK_URL is empty (check PUBLIC_BASE_URL)');
+      if (!WEBHOOK_URL) {
+        throw new Error('Webhook endpoint URL missing. Set EBAY_DELETION_ENDPOINT_URL or PUBLIC_BASE_URL.');
+      }
 
-      // Hash: challengeCode + verificationToken + endpointURL (no separators)
+      // Hash: challengeCode + verificationToken + endpointURL
       const h = crypto.createHash('sha256');
       h.update(String(challenge));
       h.update(EBAY_DELETION_VERIFICATION_TOKEN);
-      h.update(endpointUrl);
+      h.update(WEBHOOK_URL);
       const challengeResponse = h.digest('hex');
 
       return res.status(200).json({ challengeResponse });
     }
 
     if (req.method === 'POST') {
-      // Log then ACK fast
-      console.log('[eBay deletion/closure webhook] headers:', req.headers);
-      console.log('[eBay deletion/closure webhook] body:', req.body);
+      console.log('[eBay webhook] headers:', req.headers);
+      console.log('[eBay webhook] body:', req.body);
       return res.sendStatus(200);
     }
 
-    // Portal may ping GET without a challenge
     return res.status(200).json({ ok: true, note: 'Webhook ready (GET echoes challenge; POST returns 200)' });
   } catch (e) {
     console.error('[Webhook error]', e);
@@ -128,7 +114,7 @@ app.all(WEBHOOK_PATH, async (req, res) => {
   }
 });
 
-// ======================= 2) AUTH TEST (client-credentials) =======================
+// ===== 2) AUTH TEST =====
 app.get('/api/auth-test', async (req, res) => {
   try {
     const token = await getAppAccessToken(['https://api.ebay.com/oauth/api_scope']);
@@ -139,24 +125,16 @@ app.get('/api/auth-test', async (req, res) => {
   }
 });
 
-// ======================= 3) ENABLE SUBSCRIPTION =======================
-// Call this once AFTER your webhook is validated in the portal.
-// Adjust payload fields if your portal shows different names.
+// ===== 3) ENABLE SUBSCRIPTION =====
 app.post('/admin/enable-subscription', async (req, res) => {
   try {
-    requireEnv('PUBLIC_BASE_URL', PUBLIC_BASE_URL);
-    const endpointUrl = WEBHOOK_URL;
-    requireEnv('EBAY_SUBSCRIPTION_TOPIC_ID', EBAY_SUBSCRIPTION_TOPIC_ID);
-
+    if (!WEBHOOK_URL) throw new Error('No webhook URL set');
     const token = await getAppAccessToken(['https://api.ebay.com/oauth/api_scope']);
 
-    // Example payload—match what the portal/API docs show for your account.
     const payload = {
       topicId: EBAY_SUBSCRIPTION_TOPIC_ID,
       endpoint: {
-        endpoint: endpointUrl,
-        // If your portal uses a verification token/secret field in the payload, pass it here.
-        // Some setups only need the endpoint URL because the challenge proves ownership.
+        endpoint: WEBHOOK_URL,
         verificationToken: EBAY_DELETION_VERIFICATION_TOKEN || undefined
       }
     };
@@ -182,14 +160,16 @@ app.post('/admin/enable-subscription', async (req, res) => {
   }
 });
 
-// ======================= 4) SOLD SEARCH (completed items) =======================
-// GET /api/sold?title=Amazing%20Spider-Man%20300&limit=25&dateFrom=2025-01-01&dateTo=2025-08-15&minPrice=5&maxPrice=5000
+// ===== 4) SOLD SEARCH (Finding API) =====
 app.get('/api/sold', async (req, res) => {
   const { title, limit = 25, page = 1, dateFrom, dateTo, minPrice, maxPrice, includeNonComics } = req.query;
   if (!title) return res.status(400).json({ error: 'Missing title parameter' });
-  if (!EBAY_APP_ID) return res.status(500).json({ error: 'Missing EBAY_APP_ID (Production App ID) for Finding API' });
+  if (!EBAY_APP_ID) return res.status(500).json({ error: 'Missing EBAY_APP_ID' });
 
   try {
+    const EBAY_FINDING_URL = 'https://svcs.ebay.com/services/search/FindingService/v1';
+    const CATEGORY_COMICS = '63';
+
     const params = new URLSearchParams({
       'OPERATION-NAME': 'findCompletedItems',
       'SERVICE-VERSION': '1.13.0',
@@ -255,7 +235,7 @@ app.get('/api/sold', async (req, res) => {
   }
 });
 
-// ======================= HEALTH =======================
+// ===== HEALTH CHECK =====
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });

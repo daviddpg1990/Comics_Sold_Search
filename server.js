@@ -15,14 +15,14 @@ const COMICS_CATEGORY_ID = "63";
 app.use(cors());
 app.use(express.json());
 
-// ---------- Simple Health Check ----------
+// ---------- Health ----------
 app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
 
-// ---------- Small in-memory cache for SOLD results ----------
+// ---------- Small in-memory cache for SOLD (Finding API) ----------
 const SOLD_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
-const soldCache = new Map(); // key: `${title}:${limit}:${category}` -> { data, expires }
+const soldCache = new Map(); // key -> { data, expires }
 
-function getCache(key) {
+function cacheGet(key) {
   const hit = soldCache.get(key);
   if (!hit) return null;
   if (Date.now() > hit.expires) {
@@ -31,45 +31,46 @@ function getCache(key) {
   }
   return hit.data;
 }
-function setCache(key, data, ttl = SOLD_CACHE_TTL_MS) {
+function cacheSet(key, data, ttl = SOLD_CACHE_TTL_MS) {
   soldCache.set(key, { data, expires: Date.now() + ttl });
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // ---------- Axios GET with optional Finding-specific backoff ----------
 async function axiosGetWithBackoff(url, opts, { finding = false } = {}) {
-  let delay = 1000; // start at 1s
+  let delay = 1000; // 1s -> 2s -> 4s
   for (let attempt = 1; attempt <= 3; attempt++) {
     const resp = await axios.get(url, {
       timeout: 20000,
-      validateStatus: () => true, // we'll handle status codes
+      validateStatus: () => true, // we'll handle status ourselves
       ...opts,
     });
 
-    // Success
-    if (resp.status >= 200 && resp.status < 300) return resp;
+    // If not the Finding API, just return the response (OK or error)
+    if (!finding) return resp;
 
-    // If this is the Finding API and we hit eBay rate limit (Security.RateLimiter 10001), back off
-    if (finding && resp.data) {
-      try {
-        const d = resp.data.findCompletedItemsResponse?.[0];
-        const err = d?.errorMessage?.[0]?.error?.[0];
-        const code = err?.errorId?.[0];
-        const domain = (err?.domain?.[0] || "").toLowerCase();
-        if (code === "10001" && domain.includes("security")) {
-          if (attempt < 3) {
-            await new Promise((r) => setTimeout(r, delay));
-            delay *= 2; // 1s -> 2s -> 4s
-            continue;
-          }
-          // Give up with 429 to the client
-          return { status: 429, data: { error: "Rate limited", detail: err?.message?.[0] || "eBay Finding API 10001" } };
+    // For Finding API, eBay often returns 200 with an error payload.
+    // Detect Security.RateLimiter 10001 and back off.
+    try {
+      const d = resp?.data?.findCompletedItemsResponse?.[0];
+      const err = d?.errorMessage?.[0]?.error?.[0];
+      const code = err?.errorId?.[0];
+      const domain = (err?.domain?.[0] || "").toLowerCase();
+      if (code === "10001" && domain.includes("security")) {
+        if (attempt < 3) {
+          await sleep(delay);
+          delay *= 2;
+          continue;
         }
-      } catch {
-        // ignore parse errors and fall through
+        // Signal rate limit to caller with 429
+        return { status: 429, data: { error: "Rate limited", detail: err?.message?.[0] || "eBay Finding API 10001" } };
       }
+    } catch {
+      // ignore parse errors; fall through
     }
 
-    // Non-retryable: return as is
+    // Otherwise, return the response (OK or error)
     return resp;
   }
 }
@@ -77,8 +78,8 @@ async function axiosGetWithBackoff(url, opts, { finding = false } = {}) {
 // ---------- Main route: SOLD (default) or ACTIVE (?mode=browse) ----------
 /**
  * GET /api/sold?title=Hulk%20181&limit=12[&mode=browse]
- * - Default: SOLD listings via Finding API (no OAuth), category locked to 63.
- * - Active:  if ?mode=browse -> Browse API (OAuth), also locked to 63.
+ * - SOLD (default): Finding API (no OAuth), category locked to 63.
+ * - ACTIVE (optional): ?mode=browse -> Browse API (OAuth), category locked to 63.
  * - Returns normalized:
  *   { itemSummaries: [ { title, price:{value,currency}, image:{imageUrl}, itemWebUrl, soldDate } ] }
  */
@@ -113,7 +114,7 @@ app.get("/api/sold", async (req, res) => {
         price: it.price || null, // { value, currency }
         image: { imageUrl: it.image?.imageUrl || it.thumbnailImages?.[0]?.imageUrl || null },
         itemWebUrl: it.itemWebUrl || it.itemHref || null,
-        soldDate: null, // active listings have no soldDate
+        soldDate: null, // active listings don't have sold date
       }));
 
       return res.json({ itemSummaries: items });
@@ -132,12 +133,10 @@ app.get("/api/sold", async (req, res) => {
       categoryId: COMICS_CATEGORY_ID,
     };
 
-    // Serve from cache if available
+    // Serve from cache first
     const cacheKey = `${title}:${limit}:${COMICS_CATEGORY_ID}`;
-    const cached = getCache(cacheKey);
-    if (cached) {
-      return res.json(cached);
-    }
+    const cached = cacheGet(cacheKey);
+    if (cached) return res.json(cached);
 
     const r = await axiosGetWithBackoff(url, { params }, { finding: true });
     if (!r || r.status < 200 || r.status >= 300) {
@@ -166,12 +165,12 @@ app.get("/api/sold", async (req, res) => {
         price: { value: val ? String(val) : null, currency: cur },
         image: { imageUrl: it.galleryURL?.[0] || null },
         itemWebUrl: it.viewItemURL?.[0] || null,
-        soldDate: endTime, // ISO
+        soldDate: endTime, // ISO string
       };
     });
 
     const normalized = { itemSummaries: items };
-    setCache(cacheKey, normalized);
+    cacheSet(cacheKey, normalized);
     return res.json(normalized);
   } catch (err) {
     console.error("sold route error:", err);
@@ -179,17 +178,53 @@ app.get("/api/sold", async (req, res) => {
   }
 });
 
-// ---------- eBay Account Deletion Challenge ----------
+// ---------- eBay Account Deletion: verification + notifications ----------
+let deletionNotifications = [];
+const seenDeletionIds = new Set();
+
+/**
+ * POST /ebay/account-deletion
+ * - If body has { challenge: "..." } -> echo it back (verification handshake).
+ * - Else treat as real notification: store minimal record and return 200 quickly.
+ */
 app.post("/ebay/account-deletion", (req, res) => {
-  const token = process.env.EBAY_DELETION_VERIFICATION_TOKEN;
-  if (req.body?.challenge && token && req.body.challenge === token) {
-    return res.json({ challenge: token });
+  // 1) Verification challenge handshake
+  const incomingChallenge = req.body?.challenge;
+  const portalToken = process.env.EBAY_DELETION_VERIFICATION_TOKEN || null;
+
+  if (incomingChallenge) {
+    // Optional: warn if mismatch (still echo so eBay succeeds)
+    if (portalToken && incomingChallenge !== portalToken) {
+      console.warn("Account deletion verification token mismatch:", { incomingChallenge, portalToken });
+    }
+    return res.json({ challenge: incomingChallenge }); // 200 OK
   }
-  return res.status(400).json({ error: "Invalid challenge" });
+
+  // 2) Normal deletion notifications (no 'challenge' field)
+  const id =
+    req.body?.metadata?.notificationId ||
+    req.body?.notificationId ||
+    null;
+
+  if (id && seenDeletionIds.has(id)) {
+    return res.json({ status: "duplicate" }); // idempotent
+  }
+  if (id) seenDeletionIds.add(id);
+
+  deletionNotifications.push({
+    receivedAt: new Date().toISOString(),
+    id,
+    headers: {
+      "x-ebay-signature": req.get("x-ebay-signature") || null,
+      "content-type": req.get("content-type") || null,
+    },
+    body: req.body,
+  });
+
+  return res.json({ status: "received" }); // 200 OK so eBay marks success
 });
 
-// ---------- Deletion Notifications (debug helper) ----------
-let deletionNotifications = [];
+// ---------- Deletion notification viewer (debug helper) ----------
 app.post("/api/deletion-notifications", (req, res) => {
   deletionNotifications.push(req.body);
   res.json({ status: "ok" });
@@ -197,4 +232,6 @@ app.post("/api/deletion-notifications", (req, res) => {
 app.get("/api/deletion-notifications", (_req, res) => res.json(deletionNotifications));
 
 // ---------- Start ----------
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});

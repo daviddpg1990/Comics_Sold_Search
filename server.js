@@ -1,25 +1,26 @@
 import express from "express";
-import fetch from "node-fetch";
 import dotenv from "dotenv";
 import cors from "cors";
+import axios from "axios";
 
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 1000;
 
-// eBay Comics category (primary)
-const COMICS_CATEGORY_ID = "63"; // Comics & Graphic Novels
+// eBay Comics & Graphic Novels category
+const COMICS_CATEGORY_ID = "63";
 
 app.use(cors());
 app.use(express.json());
 
+// Health
 app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
 
 /**
- * GET /api/sold
- * Query sold (Finding API) by default; active (Browse API) if ?mode=browse
- * Always constrained to Comics category.
- * Returns a normalized shape: { itemSummaries: [...] }
+ * GET /api/sold?title=Hulk%20181&limit=12[&mode=browse]
+ * - Default: SOLD listings via Finding API (no OAuth), category locked to 63.
+ * - Active:  if ?mode=browse -> Browse API (OAuth), also locked to 63.
+ * - Always returns: { itemSummaries: [ { title, price:{value,currency}, image:{imageUrl}, itemWebUrl, soldDate } ] }
  */
 app.get("/api/sold", async (req, res) => {
   const { title = "", limit = 18, mode } = req.query;
@@ -27,79 +28,97 @@ app.get("/api/sold", async (req, res) => {
 
   try {
     if (mode === "browse") {
-      // ---- ACTIVE LISTINGS (Browse API) ----
+      // ---- ACTIVE (Browse API) ----
       const token = process.env.EBAY_OAUTH_TOKEN;
       if (!token) {
         return res.status(401).json({ error: "Missing EBAY_OAUTH_TOKEN for Browse API" });
       }
 
-      // category filter is enforced via category_ids
-      const url = new URL("https://api.ebay.com/buy/browse/v1/item_summary/search");
-      url.searchParams.set("q", title);
-      url.searchParams.set("limit", String(limit));
-      url.searchParams.set("category_ids", COMICS_CATEGORY_ID);
+      const url = "https://api.ebay.com/buy/browse/v1/item_summary/search";
+      const params = {
+        q: title,
+        limit: String(limit),
+        category_ids: COMICS_CATEGORY_ID,
+      };
 
-      const r = await fetch(url.toString(), {
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      const r = await axios.get(url, {
+        params,
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 20000,
+        validateStatus: () => true,
       });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) return res.status(r.status).json(data);
 
-      // return as-is (your frontend already expects itemSummaries for active)
-      return res.json({
-        itemSummaries: (data.itemSummaries || []).map((it) => ({
-          title: it.title,
-          price: it.price, // { value, currency }
-          image: { imageUrl: it.image?.imageUrl || it.thumbnailImages?.[0]?.imageUrl },
-          itemWebUrl: it.itemWebUrl || it.itemHref,
-          soldDate: null, // active listings don't have soldDate
-        })),
-      });
+      if (r.status < 200 || r.status >= 300) {
+        return res.status(r.status).json(r.data);
+      }
+
+      const data = r.data || {};
+      const items = (data.itemSummaries || []).map((it) => ({
+        title: it.title,
+        price: it.price || null, // { value, currency }
+        image: { imageUrl: it.image?.imageUrl || it.thumbnailImages?.[0]?.imageUrl || null },
+        itemWebUrl: it.itemWebUrl || it.itemHref || null,
+        soldDate: null, // active listings have no sold date
+      }));
+
+      return res.json({ itemSummaries: items });
     }
 
-    // ---- SOLD LISTINGS (Finding API) ----
-    // Enforce categoryId=63 and map to itemSummaries[] so the HTML works unchanged
-    const url = new URL("https://svcs.ebay.com/services/search/FindingService/v1");
-    url.searchParams.set("OPERATION-NAME", "findCompletedItems");
-    url.searchParams.set("SERVICE-VERSION", "1.0.0");
-    url.searchParams.set("SECURITY-APPNAME", process.env.EBAY_APP_ID || "");
-    url.searchParams.set("RESPONSE-DATA-FORMAT", "JSON");
-    url.searchParams.set("REST-PAYLOAD", "true");
-    url.searchParams.set("keywords", title);
-    url.searchParams.set("paginationInput.entriesPerPage", String(limit));
-    url.searchParams.set("categoryId", COMICS_CATEGORY_ID);
+    // ---- SOLD (Finding API) ----
+    const url = "https://svcs.ebay.com/services/search/FindingService/v1";
+    const params = {
+      "OPERATION-NAME": "findCompletedItems",
+      "SERVICE-VERSION": "1.0.0",
+      "SECURITY-APPNAME": process.env.EBAY_APP_ID || "",
+      "RESPONSE-DATA-FORMAT": "JSON",
+      "REST-PAYLOAD": "true",
+      keywords: title,
+      "paginationInput.entriesPerPage": String(limit),
+      categoryId: COMICS_CATEGORY_ID,
+    };
 
-    const r = await fetch(url.toString());
-    const raw = await r.json().catch(() => ({}));
-    if (!r.ok) return res.status(r.status).json(raw);
+    const r = await axios.get(url, {
+      params,
+      timeout: 20000,
+      validateStatus: () => true,
+    });
 
+    if (r.status < 200 || r.status >= 300) {
+      return res.status(r.status).json(r.data);
+    }
+
+    const raw = r.data || {};
     const resp = raw.findCompletedItemsResponse?.[0];
-    const items = resp?.searchResult?.[0]?.item || [];
+    const itemsRaw = resp?.searchResult?.[0]?.item || [];
 
-    const normalized = items.map((it) => {
+    const items = itemsRaw.map((it) => {
       const endTime = it.listingInfo?.[0]?.endTime?.[0] || null;
-      // prefer converted price (USD) when available
       const ss = it.sellingStatus?.[0] || {};
       const conv = ss.convertedCurrentPrice?.[0] || {};
       const cur = conv["@currencyId"] || "USD";
-      const val = conv.__value__ ?? conv.value ?? ss.currentPrice?.[0]?.__value__;
+      const val =
+        conv.__value__ ??
+        conv.value ??
+        ss.currentPrice?.[0]?.__value__ ??
+        null;
+
       return {
         title: it.title?.[0] || "Untitled",
         price: { value: val ? String(val) : null, currency: cur },
         image: { imageUrl: it.galleryURL?.[0] || null },
         itemWebUrl: it.viewItemURL?.[0] || null,
-        soldDate: endTime, // ISO string
+        soldDate: endTime, // ISO
       };
     });
 
-    return res.json({ itemSummaries: normalized });
+    return res.json({ itemSummaries: items });
   } catch (err) {
     console.error("sold route error:", err);
-    return res.status(500).json({ error: "Server error", detail: String(err) });
+    return res.status(500).json({ error: "Server error", detail: String(err?.message || err) });
   }
 });
 
-/** Deletion challenge + debug (unchanged) */
+// eBay Account Deletion Challenge
 app.post("/ebay/account-deletion", (req, res) => {
   const token = process.env.EBAY_DELETION_VERIFICATION_TOKEN;
   if (req.body?.challenge && token && req.body.challenge === token) {
@@ -108,6 +127,7 @@ app.post("/ebay/account-deletion", (req, res) => {
   return res.status(400).json({ error: "Invalid challenge" });
 });
 
+// Simple in-memory log for deletion notifications
 let deletionNotifications = [];
 app.post("/api/deletion-notifications", (req, res) => {
   deletionNotifications.push(req.body);

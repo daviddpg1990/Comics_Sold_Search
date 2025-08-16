@@ -1,6 +1,5 @@
 // server.js
 import express from 'express';
-import fetch from 'node-fetch';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import crypto from 'crypto';
@@ -217,7 +216,7 @@ app.get('/api/sold', async (req, res) => {
     }
 
     const items = resp?.searchResult?.[0]?.item || [];
-    const pagination = resp?.paginationOutput?.[0] || {};
+    the pagination = resp?.paginationOutput?.[0] || {};
     return res.json({
       query: { title, limit: Number(limit), page: Number(page), dateFrom: dateFrom || null, dateTo: dateTo || null },
       page: {
